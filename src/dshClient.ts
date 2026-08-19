@@ -64,6 +64,8 @@ export class DshClient {
   private readonly fetchImpl: typeof fetch;
   private readonly WebSocketImpl: typeof WebSocket;
   private readonly uuid: () => string;
+  private readonly muxListeners = new Set<(frame: ServerRequestFrame<MuxFrame>) => void>();
+  private readonly hostListeners = new Set<(frame: ServerRequestFrame<HostFrame>) => void>();
 
   private state: DshClientConnectionState = "disconnected";
   private running = false;
@@ -87,6 +89,18 @@ export class DshClient {
 
   isConnected(): boolean {
     return this.state === "connected";
+  }
+
+  /** 注册 mux 帧监听（返回取消函数）。 */
+  addMuxListener(fn: (frame: ServerRequestFrame<MuxFrame>) => void): () => void {
+    this.muxListeners.add(fn);
+    return () => this.muxListeners.delete(fn);
+  }
+
+  /** 注册 host 帧监听（返回取消函数）。 */
+  addHostListener(fn: (frame: ServerRequestFrame<HostFrame>) => void): () => void {
+    this.hostListeners.add(fn);
+    return () => this.hostListeners.delete(fn);
   }
 
   /** 启动连接循环并等待首次连接成功（超时抛错）。 */
@@ -159,10 +173,16 @@ export class DshClient {
       this.setState("connecting");
       try {
         const mux = await this.openSocket<MuxFrame>(`${this.wsUrl()}/api/events.mux`, (frame) => {
-          if (gen === this.generation) this.events.onMuxFrame?.(frame);
+          if (gen === this.generation) {
+            this.events.onMuxFrame?.(frame);
+            for (const fn of this.muxListeners) fn(frame);
+          }
         });
         const host = await this.openSocket<HostFrame>(`${this.wsUrl()}/api/events.host`, (frame) => {
-          if (gen === this.generation) this.events.onHostFrame?.(frame);
+          if (gen === this.generation) {
+            this.events.onHostFrame?.(frame);
+            for (const fn of this.hostListeners) fn(frame);
+          }
         });
         if (!this.running || gen !== this.generation) {
           mux.close();
