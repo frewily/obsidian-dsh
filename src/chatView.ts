@@ -67,11 +67,16 @@ export class ChatView extends ItemView {
 
   /** 服务未就绪/断线时由 main 调用。 */
   setDisconnected(disconnected: boolean): void {
-    if (this.statusEl) {
-      this.statusEl.setText(disconnected ? "正在启动/重连 dsh 服务…" : "就绪");
-    }
+    this.setStatusText(disconnected ? "正在启动/重连 dsh 服务…" : "就绪");
     if (this.sendBtnEl) {
       this.sendBtnEl.disabled = disconnected;
+    }
+  }
+
+  /** 直接设置状态行文案（如环境检测失败等）。 */
+  setStatusText(text: string): void {
+    if (this.statusEl) {
+      this.statusEl.setText(text);
     }
   }
 

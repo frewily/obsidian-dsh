@@ -3,6 +3,7 @@ import { DshProcessManager, type DshProcessConfig, type DshProcessState } from "
 import { DshClient, type DshClientConnectionState } from "./dshClient";
 import { ChatSession } from "./chatSession";
 import { CHAT_VIEW_TYPE, ChatView } from "./chatView";
+import { detectDshEnv } from "./detectEnv";
 
 /**
  * 插件入口（阶段 3）：装配 进程管理器 → 协议客户端 → 会话 → 聊天视图。
@@ -14,24 +15,16 @@ export default class ObsidianDshPlugin extends Plugin {
   private statusBarEl: HTMLElement | null = null;
   private vaultPath = "";
   private view: ChatView | null = null;
+  private envReady = false;
 
   async onload(): Promise<void> {
     this.vaultPath = this.getVaultPath();
 
     // 状态栏（阶段 3 简化版）
     this.statusBarEl = this.addStatusBarItem();
-    this.statusBarEl.setText("DSH: 启动中…");
+    this.statusBarEl.setText("DSH: 检测环境…");
 
-    // 进程管理器
-    this.processManager = new DshProcessManager(this.processConfig(), {
-      onStateChange: (state) => this.onProcessState(state),
-      onUrl: (url) => void this.onServerReady(url),
-      onError: (message) => {
-        this.statusBarEl?.setText(`DSH: ${message}`);
-      },
-    });
-
-    // 视图与命令
+    // 视图与命令（先注册，环境检测与启动异步进行）
     this.registerView(
       CHAT_VIEW_TYPE,
       (leaf) => {
@@ -46,6 +39,28 @@ export default class ObsidianDshPlugin extends Plugin {
       callback: () => void this.openChat(),
     });
 
+    // 检测 node/dsh（Obsidian 受限 PATH 下必须显式定位）
+    const env = await detectDshEnv();
+    if (!env) {
+      this.envReady = false;
+      const message = "未找到 dsh CLI，请运行 npm install -g @deepseek-ai/dsh 后重载插件（⌘R）";
+      this.statusBarEl.setText("DSH: 未找到 dsh CLI");
+      this.view?.setStatusText(message);
+      new Notice(message);
+      return;
+    }
+    this.envReady = true;
+
+    this.processManager = new DshProcessManager(
+      { ...this.processConfig(), nodePath: env.nodePath, dshEntry: env.dshEntry },
+      {
+        onStateChange: (state) => this.onProcessState(state),
+        onUrl: (url) => void this.onServerReady(url),
+        onError: (message) => {
+          this.statusBarEl?.setText(`DSH: ${message}`);
+        },
+      }
+    );
     this.processManager.start();
   }
 
@@ -126,7 +141,12 @@ export default class ObsidianDshPlugin extends Plugin {
       await workspace.revealLeaf(existing[0]);
       return;
     }
-    const leaf = workspace.getLeaf(true);
+    // 侧边栏（右侧）打开，而非主工作区标签
+    const leaf = workspace.getRightLeaf(false);
+    if (!leaf) {
+      new Notice("无法创建侧边栏视图");
+      return;
+    }
     await leaf.setViewState({ type: CHAT_VIEW_TYPE, active: true });
     await workspace.revealLeaf(leaf);
   }

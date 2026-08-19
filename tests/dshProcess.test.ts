@@ -33,6 +33,9 @@ function makeFakeChild() {
       child.exitCode = code;
       for (const cb of listeners.get("exit") ?? []) cb(code, null);
     },
+    emitError(err: Error) {
+      for (const cb of listeners.get("error") ?? []) cb(err);
+    },
   };
 }
 
@@ -208,5 +211,28 @@ describe("DshProcessManager 状态机", () => {
     } finally {
       Object.defineProperty(process, "platform", origPlatform ?? { value: "darwin" });
     }
+  });
+
+  it("spawn error（如 ENOENT）→ 按失败处理并走重启流程（不卡 starting）", () => {
+    const { manager, spawnMock, states, errors } = makeManager({ backoffBaseMs: 100 });
+    const fakes = setupSpawn(spawnMock);
+    manager.start();
+    expect(states()[0]).toBe("starting");
+
+    fakes[0].emitError(new Error("spawn dsh ENOENT"));
+    expect(states().slice(-1)).toEqual(["restarting"]);
+    expect(errors.some((m) => m.includes("启动失败"))).toBe(true);
+
+    vi.advanceTimersByTime(1000);
+    expect(spawnMock).toHaveBeenCalledTimes(2);
+    expect(states().slice(-1)).toEqual(["starting"]);
+  });
+
+  it("node + dshEntry 模式：以 node <bin.js> web 启动", () => {
+    const { manager, spawnMock } = makeManager({ nodePath: "/opt/node/bin/node", dshEntry: "/opt/lib/bin.js" });
+    const fakes = setupSpawn(spawnMock);
+    manager.start();
+    expect(spawnMock.mock.calls[0][0]).toBe("/opt/node/bin/node");
+    expect(spawnMock.mock.calls[0][1]).toEqual(["/opt/lib/bin.js", "web", "--port", "0", "--host", "127.0.0.1"]);
   });
 });

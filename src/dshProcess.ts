@@ -20,6 +20,13 @@ export interface DshProcessConfig {
   cwd: string;
   /** 独立 DSH_HOME；留空复用默认 ~/.dsh（凭证自动可用，见 M0 F1）。 */
   dshHome?: string;
+  /**
+   * 推荐的启动方式（绕过 Obsidian 受限 PATH 与 shebang 问题）：
+   * nodePath + dshEntry 同时提供时，以 `node <dshEntry> web ...` 启动。
+   */
+  nodePath?: string;
+  /** dsh 的 lib/bin.js 入口（由 detectDshEnv 检测）。 */
+  dshEntry?: string;
   /** 崩溃后自动重启，默认 true。 */
   restartOnCrash?: boolean;
   /** 等待 URL 行出现的超时（毫秒），默认 30000。 */
@@ -49,12 +56,13 @@ export interface ChildProcessLike {
   stdout: { on(event: "data", cb: (d: string | Buffer) => void): void };
   stderr: { on(event: "data", cb: (d: string | Buffer) => void): void };
   on(event: "exit", cb: (code: number | null, signal: string | null) => void): void;
+  on(event: "error", cb: (err: Error) => void): void;
   kill(signal?: string): boolean;
 }
 
 type SpawnFn = (command: string, args: string[], options: Record<string, unknown>) => ChildProcessLike;
 
-const DEFAULT_CONFIG: Required<Omit<DshProcessConfig, "binaryPath" | "cwd" | "dshHome">> = {
+const DEFAULT_CONFIG: Required<Omit<DshProcessConfig, "binaryPath" | "cwd" | "dshHome" | "nodePath" | "dshEntry">> = {
   restartOnCrash: true,
   urlTimeoutMs: 30000,
   maxRestarts: 5,
@@ -64,7 +72,7 @@ const DEFAULT_CONFIG: Required<Omit<DshProcessConfig, "binaryPath" | "cwd" | "ds
 };
 
 export class DshProcessManager {
-  private readonly config: DshProcessConfig & Required<Omit<DshProcessConfig, "binaryPath" | "dshHome">>;
+  private readonly config: DshProcessConfig & Required<Omit<DshProcessConfig, "binaryPath" | "dshHome" | "nodePath" | "dshEntry">>;
   private readonly events: DshProcessEvents;
   private readonly spawnFn: SpawnFn;
 
@@ -117,27 +125,28 @@ export class DshProcessManager {
   }
 
   private spawnProcess(): void {
-    const args = ["web", "--port", "0", "--host", "127.0.0.1"];
+    const cwd = this.config.cwd;
+    const dshHome = this.config.dshHome;
+    // 推荐路径：node <bin.js>（绕过 Obsidian 受限 PATH 的 shebang 解析）
+    const useNodeEntry = Boolean(this.config.nodePath && this.config.dshEntry);
+    const command = useNodeEntry ? (this.config.nodePath as string) : (this.config.binaryPath ?? "dsh");
+    const args = useNodeEntry
+      ? [this.config.dshEntry as string, "web", "--port", "0", "--host", "127.0.0.1"]
+      : ["web", "--port", "0", "--host", "127.0.0.1"];
     const opts: Record<string, unknown> = {
-      cwd: this.config.cwd,
-      env: this.config.dshHome ? { ...process.env, DSH_HOME: this.config.dshHome } : process.env,
+      cwd,
+      env: dshHome ? { ...process.env, DSH_HOME: dshHome } : process.env,
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
       detached: process.platform !== "win32",
     };
-    const binary = this.config.binaryPath ?? "dsh";
-    const dshHome = this.config.dshHome;
     // Windows：.cmd/.bat 包装器需经 shell 启动
-    const shell = process.platform === "win32" && /\.(cmd|bat)$/i.test(binary);
+    const shell = process.platform === "win32" && /\.(cmd|bat)$/i.test(command);
 
     this.setState("starting");
     this.url = null;
     this.stdoutBuffer = "";
-    this.child = this.spawnFn(binary, args, {
-      ...opts,
-      env: dshHome ? { ...process.env, DSH_HOME: dshHome } : process.env,
-      shell,
-    });
+    this.child = this.spawnFn(command, args, { ...opts, shell });
 
     const child = this.child;
     child.stdout?.on("data", (d: string | Buffer) => {
@@ -153,6 +162,13 @@ export class DshProcessManager {
       /* stderr 仅用于诊断，忽略 */
     });
     child.on("exit", (code: number | null) => this.onExit(code));
+    // spawn 失败（如 ENOENT：二进制不存在）不会触发 exit，必须单独处理，
+    // 否则状态永远卡在 starting（Obsidian 受限 PATH 下的真实故障）。
+    child.on("error", (err: Error) => {
+      this.events.onError?.(`dsh 启动失败: ${err.message}`);
+      this.child = null;
+      this.onExit(null);
+    });
 
     // URL 超时兜底：30 秒未就绪视为一次失败
     this.urlTimer = setTimeout(() => {
