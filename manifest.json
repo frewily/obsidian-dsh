@@ -1,0 +1,9 @@
+{
+  "id": "obsidian-dsh",
+  "name": "DeepSeek Harness",
+  "version": "0.1.0",
+  "minAppVersion": "1.4.0",
+  "description": "Claudian 式原生聊天面板：把 DeepSeek Harness 智能体（bash、文件读写、网络检索）带进你的 Obsidian vault。",
+  "author": "frewily",
+  "isDesktopOnly": true
+}
