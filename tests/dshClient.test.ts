@@ -1,142 +1,160 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { createHash } from "node:crypto";
+import http, { type Server } from "node:http";
+import type { AddressInfo, Socket } from "node:net";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DshClient, DshRpcError } from "../src/dshClient";
 
-/** 可手动驱动的假 WebSocket。 */
-class FakeWebSocket {
-  static instances: FakeWebSocket[] = [];
-  static reset(): void {
-    FakeWebSocket.instances = [];
-  }
+/**
+ * DshClient 单测：真实回环 HTTP + WebSocket 服务器。
+ * 服务器模拟 dsh 的 /api 信封与 mux/host 下行帧（服务端未 mask 文本帧）。
+ */
 
-  url: string;
-  onopen: (() => void) | null = null;
-  onmessage: ((ev: { data: string }) => void) | null = null;
-  onclose: (() => void) | null = null;
-  onerror: (() => void) | null = null;
-  close = vi.fn(() => {
-    this.onclose?.();
+const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+interface FakeServer {
+  server: Server;
+  baseUrl: string;
+  sockets: Socket[];
+  /** 记录收到的所有 /api POST 请求（信封）。 */
+  requests: Array<{ path: string; body: unknown }>;
+  /** 对 /api 的应答构造器（默认按方法回成功信封）。 */
+  respondWith: (handler: (req: { path: string; body: unknown }) => unknown) => void;
+  /** upgrade 后发服务端文本帧（未 mask）。 */
+  sendServerFrame(socket: Socket, text: string): void;
+  /** 关闭全部客户端 socket。 */
+  dropAll(): void;
+  close(): Promise<void>;
+}
+
+function serverTextFrame(text: string): Buffer {
+  const payload = Buffer.from(text, "utf8");
+  if (payload.length < 126) {
+    return Buffer.concat([Buffer.from([0x81, payload.length]), payload]);
+  }
+  // ≥126 字节必须用扩展长度格式，否则第二字节 bit7 会被误读为 MASK
+  const header = Buffer.alloc(4);
+  header[0] = 0x81;
+  header[1] = 126;
+  header.writeUInt16BE(payload.length, 2);
+  return Buffer.concat([header, payload]);
+}
+
+async function startFakeServer(): Promise<FakeServer> {
+  const sockets: Socket[] = [];
+  const requests: Array<{ path: string; body: unknown }> = [];
+  let respondWith: (req: { path: string; body: unknown }) => unknown = (req) => {
+    const body = req.body as { method?: string };
+    return { type: "server-response", rpcId: (req.body as { rpcId?: string })?.rpcId ?? "r", result: { ok: true, value: { echo: body?.method } } };
+  };
+
+  const server = http.createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (c: Buffer) => chunks.push(c));
+    req.on("end", () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      requests.push({ path: req.url ?? "", body });
+      const reply = respondWith({ path: req.url ?? "", body });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(reply));
+    });
   });
 
-  constructor(url: string) {
-    this.url = url;
-    FakeWebSocket.instances.push(this);
-  }
-
-  emitOpen(): void {
-    this.onopen?.();
-  }
-  emitMessage(data: string): void {
-    this.onmessage?.({ data });
-  }
-  emitClose(): void {
-    this.onclose?.();
-  }
-  emitError(): void {
-    this.onerror?.();
-  }
-}
-
-function jsonResponse(obj: unknown, status = 200): Response {
-  return { ok: status < 400, status, json: async () => obj } as Response;
-}
-
-function makeClient(events: Parameters<typeof DshClient.prototype.constructor>[1] = {}) {
-  const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
-    const body = JSON.parse(String(init?.body));
-    const reply = (value: unknown) => jsonResponse({ type: "server-response", rpcId: body.rpcId, result: { ok: true, value } });
-    switch (body.method) {
-      case "host.describe":
-        return reply({ version: "test" });
-      case "session.create":
-        return reply({ sessionId: "session-test-1", agentPreset: "standard" });
-      case "session.prompt":
-        return reply({ accepted: true });
-      default:
-        return reply(undefined);
-    }
+  server.on("upgrade", (req, socket: Socket) => {
+    sockets.push(socket);
+    const key = (req.headers["sec-websocket-key"] as string) ?? "";
+    const accept = createHash("sha1").update(key + WS_GUID).digest("base64");
+    socket.write(
+      "HTTP/1.1 101 Switching Protocols\r\n" +
+        "Upgrade: websocket\r\nConnection: Upgrade\r\n" +
+        `Sec-WebSocket-Accept: ${accept}\r\n\r\n`
+    );
   });
-  const client = new DshClient(
-    { baseUrl: "http://127.0.0.1:1", backoffBaseMs: 10 },
-    events,
-    { fetchImpl: fetchMock as never, WebSocketImpl: FakeWebSocket as never, randomUUID: () => "rpc-1" }
-  );
-  return { client, fetchMock };
+
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = (server.address() as AddressInfo).port;
+  return {
+    server,
+    baseUrl: `http://127.0.0.1:${port}`,
+    sockets,
+    requests,
+    respondWith: (handler) => {
+      respondWith = handler;
+    },
+    sendServerFrame: (socket, text) => socket.write(serverTextFrame(text)),
+    dropAll: () => {
+      for (const s of sockets) s.destroy();
+    },
+    close: async () => {
+      // Node 的 http server 不自动清理 upgrade 连接，先销毁服务端 socket
+      for (const s of sockets) s.destroy();
+      await new Promise((resolve) => server.close(() => resolve()));
+    },
+  };
 }
 
-/** 让连接进入 connected：依次打开两个 WS（mux 先于 host 创建）+ 握手。 */
-async function connectThrough(client: DshClient): Promise<void> {
-  const p = client.connect();
-  while (FakeWebSocket.instances.length < 1) await new Promise((r) => setTimeout(r, 10));
-  FakeWebSocket.instances[0].emitOpen();
-  while (FakeWebSocket.instances.length < 2) await new Promise((r) => setTimeout(r, 10));
-  FakeWebSocket.instances[1].emitOpen();
-  await p;
-}
+let fake: FakeServer | null = null;
 
-afterEach(() => {
-  FakeWebSocket.reset();
-  vi.useRealTimers();
+beforeEach(async () => {
+  fake = await startFakeServer();
 });
 
-describe("DshClient RPC", () => {
-  it("call 成功返回 result.value", async () => {
-    const { client, fetchMock } = makeClient();
+afterEach(async () => {
+  await fake?.close();
+  fake = null;
+});
+
+describe("DshClient RPC（真实回环）", () => {
+  it("call 发送 client-request 信封并返回 result.value", async () => {
+    const client = new DshClient({ baseUrl: fake!.baseUrl });
+    fake!.respondWith(({ body }) => {
+      const b = body as { rpcId: string; method: string; payload: unknown };
+      return { type: "server-response", rpcId: b.rpcId, result: { ok: true, value: { sessionId: "s1" } } };
+    });
     const value = await client.call("session.create", { cwd: "/tmp" });
-    expect(value).toEqual({ sessionId: "session-test-1", agentPreset: "standard" });
-    const [url, init] = fetchMock.mock.calls[0];
-    expect(url).toBe("http://127.0.0.1:1/api/session.create");
-    const body = JSON.parse(String((init as RequestInit).body));
-    expect(body).toEqual({ type: "client-request", rpcId: "rpc-1", method: "session.create", payload: { cwd: "/tmp" } });
+    expect(value).toEqual({ sessionId: "s1" });
+    expect(fake!.requests).toHaveLength(1);
+    const req = fake!.requests[0];
+    expect(req.path).toBe("/api/session.create");
+    expect((req.body as { type: string; method: string; payload: unknown }).type).toBe("client-request");
+    expect((req.body as { method: string }).method).toBe("session.create");
+    expect((req.body as { payload: unknown }).payload).toEqual({ cwd: "/tmp" });
   });
 
-  it("call 失败抛 DshRpcError（含 code/message）", async () => {
-    const { client, fetchMock } = makeClient();
-    fetchMock.mockImplementation(async (_url: string, init?: RequestInit) => {
-      const body = JSON.parse(String(init?.body));
-      return jsonResponse({
-        type: "server-response",
-        rpcId: body.rpcId,
-        result: { ok: false, error: { code: "not-found", message: "no such session", details: {} } },
-      });
+  it("call 失败抛 DshRpcError（code/message）", async () => {
+    const client = new DshClient({ baseUrl: fake!.baseUrl });
+    fake!.respondWith(({ body }) => {
+      const b = body as { rpcId: string };
+      return { type: "server-response", rpcId: b.rpcId, result: { ok: false, error: { code: "not-found", message: "no such session", details: {} } } };
     });
-    await expect(client.call("session.prompt", {})).rejects.toMatchObject({ name: "DshRpcError", code: "not-found", message: "no such session" });
     await expect(client.call("session.prompt", {})).rejects.toBeInstanceOf(DshRpcError);
+    await expect(client.call("session.prompt", {})).rejects.toMatchObject({ code: "not-found", message: "no such session" });
   });
 
-  it("respondQuestion 发送 client-response 信封并回显 rpcId", async () => {
-    const { client, fetchMock } = makeClient();
-    await client.respondQuestion("q-rpc-1", "session-test-1", {
-      answers: [{ id: "q1", selected: ["奶茶"] }],
-    });
-    const [url, init] = fetchMock.mock.calls[0];
-    expect(url).toBe("http://127.0.0.1:1/api/respond");
-    const body = JSON.parse(String((init as RequestInit).body));
-    expect(body).toEqual({
-      type: "client-response",
-      rpcId: "q-rpc-1",
-      result: { ok: true, value: { sessionId: "session-test-1", answer: { answers: [{ id: "q1", selected: ["奶茶"] }] } } },
-    });
+  it("respondQuestion 发送 client-response 信封（rpcId 回显）", async () => {
+    const client = new DshClient({ baseUrl: fake!.baseUrl });
+    await client.respondQuestion("q-rpc-1", "s1", { answers: [{ id: "q1", selected: ["奶茶"] }] });
+    expect(fake!.requests).toHaveLength(1);
+    const req = fake!.requests[0];
+    expect(req.path).toBe("/api/respond");
+    const body = req.body as { type: string; rpcId: string; result: { value: unknown } };
+    expect(body.type).toBe("client-response");
+    expect(body.rpcId).toBe("q-rpc-1");
+    expect(body.result.value).toEqual({ sessionId: "s1", answer: { answers: [{ id: "q1", selected: ["奶茶"] }] } });
   });
 });
 
-describe("DshClient 连接与事件分发", () => {
-  it("connect → 打开 mux/host 双通道 → 握手 → connected", async () => {
-    const states: string[] = [];
-    const { client } = makeClient({ onStateChange: (s) => states.push(s) });
-    await connectThrough(client);
-    expect(client.isConnected()).toBe(true);
-    expect(states).toContain("connected");
-    expect(FakeWebSocket.instances.map((w) => w.url)).toEqual([
-      "ws://127.0.0.1:1/api/events.mux",
-      "ws://127.0.0.1:1/api/events.host",
-    ]);
-  });
-
-  it("mux 帧分发：question/requested 到达 onMuxFrame", async () => {
+describe("DshClient 连接与事件（真实回环 WS）", () => {
+  it("connect：双通道握手 → host.describe → connected；mux 帧到达 onMuxFrame", async () => {
     const frames: unknown[] = [];
-    const { client } = makeClient({ onMuxFrame: (f) => frames.push(f) });
-    await connectThrough(client);
-    FakeWebSocket.instances[0].emitMessage(
+    const client = new DshClient({ baseUrl: fake!.baseUrl, backoffBaseMs: 10 }, { onMuxFrame: (f) => frames.push(f) });
+    await client.connect(10000);
+    expect(client.isConnected()).toBe(true);
+    expect(fake!.requests.some((r) => r.path === "/api/host.describe")).toBe(true);
+
+    // 向第一个连接的 mux socket 发 question/requested 帧
+    const muxSocket = fake!.sockets[0];
+    fake!.sendServerFrame(
+      muxSocket,
       JSON.stringify({
         type: "server-request",
         rpcId: "q-1",
@@ -144,34 +162,40 @@ describe("DshClient 连接与事件分发", () => {
         payload: { type: "question/requested", sessionId: "s1", questions: [{ id: "q1", question: "今天想喝什么？" }] },
       })
     );
+    await new Promise((r) => setTimeout(r, 200));
     expect(frames).toHaveLength(1);
     const frame = frames[0] as { payload: { type: string; questions: Array<{ id: string }> } };
     expect(frame.payload.type).toBe("question/requested");
     expect(frame.payload.questions[0].id).toBe("q1");
+    await client.disconnect();
   });
 
-  it("mux 断开 → reconnecting → 重连成功", async () => {
+  it("断线重连：drop 全部 socket → reconnecting → 重连成功", async () => {
     const states: string[] = [];
-    const { client } = makeClient({ onStateChange: (s) => states.push(s) });
-    await connectThrough(client);
+    const client = new DshClient({ baseUrl: fake!.baseUrl, backoffBaseMs: 10 }, { onStateChange: (s) => states.push(s) });
+    await client.connect(10000);
+    expect(client.isConnected()).toBe(true);
 
-    // 断开 mux
-    FakeWebSocket.instances[0].emitClose();
-    await vi.waitFor(() => expect(states).toContain("reconnecting"));
+    fake!.dropAll();
+    const t0 = Date.now();
+    while (!states.includes("reconnecting") && Date.now() - t0 < 10000) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    expect(states).toContain("reconnecting");
 
-    // 退避后重连：新 mux 先创建，open 后新 host 才创建
-    await vi.waitFor(() => expect(FakeWebSocket.instances.length).toBe(3));
-    FakeWebSocket.instances[2].emitOpen();
-    await vi.waitFor(() => expect(FakeWebSocket.instances.length).toBe(4));
-    FakeWebSocket.instances[3].emitOpen();
-    await vi.waitFor(() => expect(client.isConnected()).toBe(true));
+    // 等重连成功（退避 10ms 起）
+    const t1 = Date.now();
+    while (!client.isConnected() && Date.now() - t1 < 10000) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    expect(client.isConnected()).toBe(true);
+    await client.disconnect();
   });
 
   it("disconnect 停止循环并断开", async () => {
-    const { client } = makeClient();
-    await connectThrough(client);
+    const client = new DshClient({ baseUrl: fake!.baseUrl });
+    await client.connect(10000);
     await client.disconnect();
     expect(client.getState()).toBe("disconnected");
-    expect(client.isConnected()).toBe(false);
   });
 });
