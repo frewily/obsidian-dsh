@@ -70,6 +70,33 @@ describe("ChatSession 会话层", () => {
     expect(list[0].blocks[0]).toEqual({ kind: "text", text: "你好" });
   });
 
+  it("系统注入消息（source.kind=plugin）不渲染（实测刷屏回归）", () => {
+    const { session, messages } = makeSession();
+    session.handleFrame(
+      sessionEvent({
+        type: "user/message",
+        data: {
+          content: [{ type: "text", text: "Current runtime context. This snapshot supersedes..." }],
+          source: { kind: "plugin", plugin: "@deepseek-ai/dsh-system-prompt", form: "snapshot" },
+        },
+      })
+    );
+    session.handleFrame(
+      sessionEvent({
+        type: "user/message",
+        data: {
+          content: [{ type: "text", text: "<system-reminder>skills...</system-reminder>" }],
+          source: { kind: "plugin", plugin: "@deepseek-ai/dsh-system-prompt", form: "reminder" },
+        },
+      })
+    );
+    // 真实用户消息仍渲染
+    session.handleFrame(sessionEvent({ type: "user/message", data: { content: [{ type: "text", text: "你好" }] } }));
+    const list = messages();
+    expect(list).toHaveLength(1);
+    expect(list[0].blocks[0]).toEqual({ kind: "text", text: "你好" });
+  });
+
   it("turn/start + text-delta 流式累积 → 完成", () => {
     const { session, messages, states } = makeSession();
     session.handleFrame(sessionEvent({ type: "turn/start" }));

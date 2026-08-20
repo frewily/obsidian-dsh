@@ -151,6 +151,10 @@ export class ChatSession {
   private handleSessionEvent(event: { type: string; data?: Record<string, unknown> }): void {
     switch (event.type) {
       case "user/message": {
+        // 系统注入消息（runtime context、system-reminder 等）带 source.kind="plugin"，
+        // 是发给 agent 的上下文，不是用户输入，不渲染（实测会话文件结构）
+        const source = (event.data as { source?: { kind?: string } } | undefined)?.source;
+        if (source?.kind === "plugin") return;
         const text = extractText(event.data);
         this.pushMessage({ id: `m${++this.msgSeq}`, role: "user", blocks: [{ kind: "text", text }], status: "done" });
         break;

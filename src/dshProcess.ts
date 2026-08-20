@@ -109,19 +109,17 @@ export class DshProcessManager {
     this.spawnProcess();
   }
 
-  /** 主动停止：SIGTERM，2 秒未退出则 SIGKILL。 */
+  /** 主动停止：SIGTERM，500ms 未退出则 SIGKILL（Obsidian 退出场景 renderer 很快销毁）。 */
   stop(): void {
     if (this.state === "stopped") return;
     this.stopRequested = true;
     this.clearTimers();
     this.setState("stopping");
     this.killChild("SIGTERM");
-    // SIGKILL 兜底
+    // SIGKILL 兜底（短间隔：Obsidian 卸载时 renderer 存活时间不可控）
     setTimeout(() => {
-      if (this.child !== null && (this.child.exitCode ?? null) === null) {
-        this.killChild("SIGKILL");
-      }
-    }, 2000).unref();
+      this.killChild("SIGKILL");
+    }, 500).unref();
   }
 
   private spawnProcess(): void {
@@ -224,13 +222,18 @@ export class DshProcessManager {
   private killChild(signal: "SIGTERM" | "SIGKILL"): void {
     const child = this.child;
     if (child === null) return;
-    try {
-      if (process.platform !== "win32" && child.pid !== undefined) {
-        // 杀整个进程组（含孙进程），防孤儿
+    // 双保险：进程组 kill 失败（Electron renderer 下负 pid 可能受限）时
+    // fallback 到 child.kill；两者都失败才放弃
+    if (process.platform !== "win32" && child.pid !== undefined) {
+      try {
         process.kill(-child.pid, signal);
-      } else {
-        child.kill(signal);
+        return;
+      } catch {
+        /* fallthrough → child.kill */
       }
+    }
+    try {
+      child.kill(signal);
     } catch {
       /* 进程可能已退出 */
     }
