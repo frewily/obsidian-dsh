@@ -151,10 +151,10 @@ export class ChatSession {
   private handleSessionEvent(event: { type: string; data?: Record<string, unknown> }): void {
     switch (event.type) {
       case "user/message": {
-        // 系统注入消息（runtime context、system-reminder 等）带 source.kind="plugin"，
-        // 是发给 agent 的上下文，不是用户输入，不渲染（实测会话文件结构）
+        // 系统注入消息（runtime context / system-reminder 等）带 source.kind
+        // plugin / skill-catalog，是发给 agent 的上下文，不是用户输入，不渲染
         const source = (event.data as { source?: { kind?: string } } | undefined)?.source;
-        if (source?.kind === "plugin") return;
+        if (source?.kind !== undefined && source.kind !== "user") return;
         const text = extractText(event.data);
         this.pushMessage({ id: `m${++this.msgSeq}`, role: "user", blocks: [{ kind: "text", text }], status: "done" });
         break;
@@ -166,23 +166,72 @@ export class ChatSession {
         this.emit();
         break;
       case "assistant/chunk": {
-        const chunk = event.data?.chunk as { type?: string; text?: string; blockType?: string; reason?: { kind?: string; failure?: { message?: string } } } | undefined;
+        const chunk = event.data?.chunk as
+          | {
+              type?: string;
+              text?: string;
+              blockType?: string;
+              index?: number;
+              block?: { type?: string; text?: string; name?: string; id?: string };
+              name?: string;
+              reason?: { kind?: string; failure?: { message?: string } };
+            }
+          | undefined;
         if (!chunk || !this.currentAssistant) return;
         const msg = this.currentAssistant;
-        if (chunk.type === "block-start" && chunk.blockType === "reasoning") {
-          msg.blocks.push({ kind: "reasoning", text: "" });
-        } else if (chunk.type === "reasoning-delta") {
-          const last = msg.blocks[msg.blocks.length - 1];
-          if (last?.kind === "reasoning") last.text = (last.text ?? "") + (chunk.text ?? "");
-        } else if (chunk.type === "text-delta") {
-          const last = msg.blocks[msg.blocks.length - 1];
-          if (last?.kind === "text") last.text = (last.text ?? "") + (chunk.text ?? "");
-          else msg.blocks.push({ kind: "text", text: chunk.text ?? "" });
-        } else if (chunk.type === "finish") {
-          if (chunk.reason?.kind === "error") {
-            msg.status = "error";
-            msg.error = chunk.reason.failure?.message ?? "LLM 调用失败";
+        switch (chunk.type) {
+          case "block-start": {
+            // 按类型建块（text 块必须有占位，否则 text-delta 会错位）
+            if (chunk.blockType === "reasoning") msg.blocks.push({ kind: "reasoning", text: "" });
+            else if (chunk.blockType === "text") msg.blocks.push({ kind: "text", text: "" });
+            else if (chunk.blockType === "tool-call") msg.blocks.push({ kind: "tool", toolName: "…", toolStatus: "running" });
+            break;
           }
+          case "reasoning-delta": {
+            const last = msg.blocks[msg.blocks.length - 1];
+            if (last?.kind === "reasoning") last.text = (last.text ?? "") + (chunk.text ?? "");
+            break;
+          }
+          case "text-delta": {
+            const last = msg.blocks[msg.blocks.length - 1];
+            if (last?.kind === "text") last.text = (last.text ?? "") + (chunk.text ?? "");
+            else msg.blocks.push({ kind: "text", text: chunk.text ?? "" });
+            break;
+          }
+          case "tool-call-delta": {
+            // 工具增量：补全工具名
+            const last = msg.blocks[msg.blocks.length - 1];
+            if (last?.kind === "tool" && chunk.name) last.toolName = chunk.name;
+            break;
+          }
+          case "block-end": {
+            // 完整块内容兜底：流式增量可能缺失（实测 text-delta 仅开头片段），
+            // block-end 携带权威内容，按 index 覆盖
+            const block = chunk.block;
+            if (!block) break;
+            const target = msg.blocks[chunk.index ?? -1];
+            if (block.type === "text" && block.text) {
+              if (target?.kind === "text") target.text = block.text;
+              else msg.blocks.push({ kind: "text", text: block.text });
+            } else if (block.type === "reasoning" && block.text) {
+              if (target?.kind === "reasoning") target.text = block.text;
+            } else if (block.type === "tool-call") {
+              if (target?.kind === "tool") {
+                target.toolName = block.name ?? target.toolName ?? "?";
+                target.toolStatus = "running";
+              }
+            }
+            break;
+          }
+          case "finish": {
+            if (chunk.reason?.kind === "error") {
+              msg.status = "error";
+              msg.error = chunk.reason.failure?.message ?? "LLM 调用失败";
+            }
+            break;
+          }
+          default:
+            break;
         }
         this.emit();
         break;
@@ -190,12 +239,19 @@ export class ChatSession {
       case "tool/call": {
         if (!this.currentAssistant) return;
         const call = event.data as { name?: string; arguments?: string };
-        this.currentAssistant.blocks.push({
-          kind: "tool",
-          toolName: call.name ?? "?",
-          toolArgs: formatToolArgs(call.arguments),
-          toolStatus: "running",
-        });
+        // block-start(tool-call) 可能已建块（含 tool-call-delta），复用而非重复 push
+        const existing = [...this.currentAssistant.blocks].reverse().find((b) => b.kind === "tool" && b.toolStatus === "running");
+        if (existing?.kind === "tool") {
+          existing.toolName = call.name ?? existing.toolName;
+          existing.toolArgs = formatToolArgs(call.arguments);
+        } else {
+          this.currentAssistant.blocks.push({
+            kind: "tool",
+            toolName: call.name ?? "?",
+            toolArgs: formatToolArgs(call.arguments),
+            toolStatus: "running",
+          });
+        }
         this.emit();
         break;
       }

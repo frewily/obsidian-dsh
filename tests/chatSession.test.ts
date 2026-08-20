@@ -70,7 +70,7 @@ describe("ChatSession 会话层", () => {
     expect(list[0].blocks[0]).toEqual({ kind: "text", text: "你好" });
   });
 
-  it("系统注入消息（source.kind=plugin）不渲染（实测刷屏回归）", () => {
+  it("系统注入消息（source.kind=plugin / skill-catalog）不渲染（实测刷屏回归）", () => {
     const { session, messages } = makeSession();
     session.handleFrame(
       sessionEvent({
@@ -86,7 +86,7 @@ describe("ChatSession 会话层", () => {
         type: "user/message",
         data: {
           content: [{ type: "text", text: "<system-reminder>skills...</system-reminder>" }],
-          source: { kind: "plugin", plugin: "@deepseek-ai/dsh-system-prompt", form: "reminder" },
+          source: { kind: "skill-catalog" },
         },
       })
     );
@@ -95,6 +95,41 @@ describe("ChatSession 会话层", () => {
     const list = messages();
     expect(list).toHaveLength(1);
     expect(list[0].blocks[0]).toEqual({ kind: "text", text: "你好" });
+  });
+
+  it("完整块渲染：block-start(text) + 片段 text-delta + block-end 完整文本兜底（实测断点回归）", () => {
+    const { session, messages } = makeSession();
+    session.handleFrame(sessionEvent({ type: "turn/start" }));
+    // 第一轮：思考 + 工具调用（block-start reasoning / tool-call）
+    session.handleFrame(chunk({ type: "block-start", index: 0, blockType: "reasoning" }));
+    session.handleFrame(chunk({ type: "reasoning-delta", text: "用户说你好" }));
+    session.handleFrame(chunk({ type: "block-start", index: 1, blockType: "tool-call" }));
+    session.handleFrame(chunk({ type: "tool-call-delta", index: 1, id: "c1", name: "skill", argumentsDelta: "" }));
+    session.handleFrame(chunk({ type: "block-end", index: 0, block: { type: "reasoning", text: "用户说你好（完整思考）" } }));
+    session.handleFrame(chunk({ type: "block-end", index: 1, block: { type: "tool-call", id: "c1", name: "skill" } }));
+    session.handleFrame(chunk({ type: "finish", reason: { kind: "tool-calls" } }));
+
+    // 第二轮：文本回复（block-start text → 片段 text-delta → block-end 完整文本）
+    session.handleFrame(chunk({ type: "block-start", index: 0, blockType: "reasoning" }));
+    session.handleFrame(chunk({ type: "block-start", index: 1, blockType: "text" }));
+    session.handleFrame(chunk({ type: "text-delta", text: "Users" }));
+    session.handleFrame(chunk({ type: "block-end", index: 0, block: { type: "reasoning", text: "应该回复你好" } }));
+    session.handleFrame(chunk({ type: "block-end", index: 1, block: { type: "text", text: "你好！👋 我是助手。" } }));
+    session.handleFrame(chunk({ type: "finish", reason: { kind: "stop" } }));
+    session.handleFrame(sessionEvent({ type: "assistant/message" }));
+    session.handleFrame(sessionEvent({ type: "turn/end" }));
+
+    const msg = messages()[0];
+    expect(msg.status).toBe("done");
+    const texts = msg.blocks.filter((b) => b.kind === "text");
+    expect(texts.map((b) => b.text).join("")).toContain("你好！👋 我是助手。");
+    // reasoning 块为 block-end 的完整内容
+    const reasoning = msg.blocks.find((b) => b.kind === "reasoning");
+    expect(reasoning?.text).toBe("应该回复你好");
+    // 工具块不重复（block-start 建块 + tool/call 复用）
+    const tools = msg.blocks.filter((b) => b.kind === "tool");
+    expect(tools).toHaveLength(1);
+    expect(tools[0].toolName).toBe("skill");
   });
 
   it("turn/start + text-delta 流式累积 → 完成", () => {
